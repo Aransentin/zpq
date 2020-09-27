@@ -120,7 +120,7 @@ pub fn Connection(comptime statements: []const Statement) type {
             };
 
             // Parse the handshake reply
-            var buf: [512]u8 = undefined;
+            var buf: [1024]u8 = undefined;
             var bp: usize = 0;
             var handshake_ok: bool = false;
 
@@ -222,11 +222,48 @@ pub fn Connection(comptime statements: []const Statement) type {
                     inline for (stmnt.parameters) |param| {
                         sbuf = sbuf ++ std.mem.asBytes(&std.mem.nativeToBig(u32, @enumToInt(param)));
                     }
+                    if (builtin.mode == .Debug) {
+                        const evsize_desc: usize = 4 + 1 + stmnt.name.len + 1;
+                        sbuf = sbuf ++ [_]u8{'D'} ++ std.mem.asBytes(&std.mem.nativeToBig(u32, evsize_desc));
+                        sbuf = sbuf ++ [_]u8{'S'} ++ stmnt.name ++ [_]u8{0};
+                    }
                 }
                 sbuf = sbuf ++ [_]u8{'S'} ++ std.mem.asBytes(&std.mem.nativeToBig(u32, 4)); // Sync
                 break :blk sbuf;
             };
             _ = try self.file.writeAll(sbuf);
+
+            // Create a slice of slices of the output Oids so we can index into it from a non-comptime variable
+            const st_outputs = comptime blk: {
+                var outp: []const []const Oid = &[0][]const Oid{};
+                for (statements) |stmnt| {
+                    var oids: []const Oid = &[0]Oid{};
+                    for (@typeInfo(stmnt.output).Struct.fields) |val| {
+                        const T = val.field_type;
+                        oids = oids ++ switch (T) {
+                            bool => &[1]Oid{Oid.Bool},
+                            i8 => &[1]Oid{Oid.Char},
+                            i16 => &[1]Oid{Oid.Int2},
+                            i32 => &[1]Oid{Oid.Int4},
+                            i64 => &[1]Oid{Oid.Int8},
+                            f32 => &[1]Oid{Oid.Float4},
+                            f64 => &[1]Oid{Oid.Float8},
+                            else => @compileError("Return value type not yet implemented: " ++ @typeName(T)),
+                        };
+                    }
+                    outp = outp ++ &[1][]const Oid{oids};
+                }
+                break :blk outp;
+            };
+
+            // ... also the names, for debugging
+            const st_names = comptime blk: {
+                var outp: []const []const u8 = &[0][]const u8{};
+                for (statements) |stmnt| {
+                    outp = outp ++ &[1][]const u8{stmnt.name};
+                }
+                break :blk outp;
+            };
 
             // Parse the statement replies
             var statements_ok: usize = 0;
@@ -267,6 +304,40 @@ pub fn Connection(comptime statements: []const Statement) type {
                             }
                             statements_ok_complete = true;
                         },
+                        't' => {
+                            if (builtin.mode != .Debug) unreachable;
+                            // This data is just a copy of what we sent PostgreSQL above, so whatever
+                        },
+                        'T' => {
+                            if (builtin.mode != .Debug) unreachable;
+                            if (mlen < 6) return error.MalformedProtocolMessage;
+
+                            const nfields = std.mem.readIntSliceBig(u16, buf[p + 5 .. p + 7]);
+                            const outputs = st_outputs[statements_ok - 1];
+                            if (outputs.len != nfields) {
+                                std.log.err("Output mismatch for statement '{}': expected {} outputs, got {}", .{ st_names[statements_ok - 1], outputs.len, nfields });
+                                return error.OutputTypeMismatch;
+                            }
+                            const fbuf = buf[p + 7 .. p + mlen + 1];
+                            var pp: usize = 0;
+                            var i: usize = 0;
+                            while (i < nfields) : (i += 1) {
+                                const nzero = std.mem.indexOfScalar(u8, fbuf[pp..], 0) orelse return error.MalformedProtocolMessage;
+                                if (pp + nzero + 1 + 18 > fbuf.len) return error.MalformedProtocolMessage;
+
+                                pp += nzero + 1 + 4 + 2; // Name, null byte, table Oid, column index -> we don't care
+                                const oid = std.mem.readIntSliceBig(u32, fbuf[pp .. pp + 4]);
+                                const expected_oid = st_outputs[statements_ok - 1][i];
+                                if (oid != @enumToInt(st_outputs[statements_ok - 1][i])) {
+                                    std.log.err("Oid mismatch for statement '{}': expected {} for output {}, got {}", .{ st_names[statements_ok - 1], expected_oid, i, @intToEnum(Oid, oid) });
+                                    return error.OutputTypeMismatch;
+                                }
+                                pp += 4 + 2; // oid, column length
+
+                                const tmod = std.mem.readIntSliceBig(i32, fbuf[pp .. pp + 4]);
+                                pp += 4 + 2; // tmod, format
+                            }
+                        },
                         else => {
                             // TODO: Handle this?
                             unreachable;
@@ -280,9 +351,6 @@ pub fn Connection(comptime statements: []const Statement) type {
                 if (statements_ok_complete and bp == 0)
                     break;
             }
-
-            // TODO: If debug, check statement reply types and compare with what the specified output
-            // DESCRIBE etc
 
             return self;
         }
@@ -331,29 +399,35 @@ pub fn Connection(comptime statements: []const Statement) type {
 
                                 inline for (@typeInfo(statement.output).Struct.fields) |val| {
                                     const clen = try reader.readIntBig(u32);
-                                    // TODO: If debug, check that clen matches what we expect
 
                                     const T = val.field_type;
                                     switch (T) {
                                         bool => {
+                                            if (builtin.mode == .Debug and clen != 1) return error.TypeLengthMismatch;
                                             @field(output, val.name) = (try reader.readByte()) == 1;
                                         },
                                         i8 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(i8)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = try reader.readByte();
                                         },
                                         i16 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(i16)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = try reader.readIntBig(i16);
                                         },
                                         i32 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(i32)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = try reader.readIntBig(i32);
                                         },
                                         i64 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(i64)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = try reader.readIntBig(i64);
                                         },
                                         f32 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(f32)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = @bitCast(f32, try reader.readIntBig(u32));
                                         },
                                         f64 => {
+                                            if (builtin.mode == .Debug and clen != @sizeOf(f64)) return error.TypeLengthMismatch;
                                             @field(output, val.name) = @bitCast(f64, try reader.readIntBig(u64));
                                         },
                                         u8, u16, u32, u64 => @compileError("PostgreSQL does not support unsigned variables: " ++ @typeName(T)),
